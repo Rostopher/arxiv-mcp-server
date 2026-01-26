@@ -3,7 +3,9 @@
 import arxiv
 import json
 import logging
-from typing import Dict, Any, List
+import httpx
+import xml.etree.ElementTree as ET
+from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone
 from dateutil import parser
 import mcp.types as types
@@ -11,6 +13,16 @@ from ..config import Settings
 
 logger = logging.getLogger("arxiv-mcp-server")
 settings = Settings()
+
+# arXiv API endpoint for raw queries (bypasses arxiv package URL encoding issues)
+# Use HTTPS to avoid redirect from http -> https
+ARXIV_API_URL = "https://export.arxiv.org/api/query"
+
+# XML namespaces used in arXiv Atom feed
+ARXIV_NS = {
+    "atom": "http://www.w3.org/2005/Atom",
+    "arxiv": "http://arxiv.org/schemas/atom",
+}
 
 # Valid arXiv category prefixes for validation
 VALID_CATEGORIES = {
@@ -35,6 +47,182 @@ VALID_CATEGORIES = {
     "nucl-th",
     "quant-ph",
 }
+
+
+async def _raw_arxiv_search(
+    query: str,
+    max_results: int = 10,
+    sort_by: str = "relevance",
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    categories: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Perform arXiv search using raw HTTP requests.
+
+    This bypasses the arxiv Python package to avoid URL encoding issues
+    with date filters. The arxiv package encodes '+' as '%2B' which breaks
+    the submittedDate:[YYYYMMDD+TO+YYYYMMDD] syntax.
+    """
+    # Build query components
+    query_parts = []
+
+    if query.strip():
+        query_parts.append(f"({query})")
+
+    # Add category filtering
+    if categories:
+        category_filter = " OR ".join(f"cat:{cat}" for cat in categories)
+        query_parts.append(f"({category_filter})")
+
+    # Add date filtering using arXiv API syntax
+    if date_from or date_to:
+        try:
+            if date_from:
+                start_date = parser.parse(date_from).strftime("%Y%m%d0000")
+            else:
+                start_date = "199107010000"  # arXiv started July 1991
+
+            if date_to:
+                end_date = parser.parse(date_to).strftime("%Y%m%d2359")
+            else:
+                end_date = datetime.now().strftime("%Y%m%d2359")
+
+            # CRITICAL: This must NOT be URL-encoded. The '+' in '+TO+' must remain literal.
+            date_filter = f"submittedDate:[{start_date}+TO+{end_date}]"
+            query_parts.append(date_filter)
+            logger.debug(f"Added date filter: {date_filter}")
+        except (ValueError, TypeError) as e:
+            logger.error(f"Error parsing dates: {e}")
+            raise ValueError(f"Invalid date format. Use YYYY-MM-DD format: {e}")
+
+    if not query_parts:
+        raise ValueError("No search criteria provided")
+
+    # Combine query parts with AND (space in arXiv = AND)
+    final_query = " AND ".join(query_parts)
+    logger.debug(f"Raw API query: {final_query}")
+
+    # Map sort parameter to arXiv API values
+    sort_map = {
+        "relevance": "relevance",
+        "date": "submittedDate",
+    }
+    sort_order = "descending"
+
+    # Build the URL manually to avoid encoding the '+' in date ranges
+    # We encode most parameters but carefully preserve '+TO+' in date filters
+    base_params = f"max_results={max_results}&sortBy={sort_map.get(sort_by, 'relevance')}&sortOrder={sort_order}"
+
+    # Manually construct search_query parameter
+    # We need to encode spaces and special chars BUT NOT the '+' in '+TO+'
+    # Strategy: encode the query parts separately, then join with encoded AND
+    encoded_query = (
+        final_query.replace(" AND ", "+AND+").replace(" OR ", "+OR+").replace(" ", "+")
+    )
+    # But we need to be careful about existing '+TO+' - it should stay as-is
+    # Since we built the date filter with literal '+TO+', it's already correct
+
+    url = f"{ARXIV_API_URL}?search_query={encoded_query}&{base_params}"
+    logger.debug(f"Raw API URL: {url}")
+
+    # Make the request
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.get(url)
+        response.raise_for_status()
+
+    # Parse the Atom XML response
+    return _parse_arxiv_atom_response(response.text)
+
+
+def _parse_arxiv_atom_response(xml_text: str) -> List[Dict[str, Any]]:
+    """Parse arXiv Atom XML response into paper dictionaries."""
+    results = []
+
+    try:
+        root = ET.fromstring(xml_text)
+
+        for entry in root.findall("atom:entry", ARXIV_NS):
+            # Extract paper ID from the id URL
+            id_elem = entry.find("atom:id", ARXIV_NS)
+            if id_elem is None or id_elem.text is None:
+                continue
+
+            # ID format: http://arxiv.org/abs/XXXX.XXXXX or http://arxiv.org/abs/category/XXXXXXX
+            paper_id = id_elem.text.split("/abs/")[-1]
+            # Remove version suffix for short ID
+            short_id = paper_id.split("v")[0] if "v" in paper_id else paper_id
+
+            # Title
+            title_elem = entry.find("atom:title", ARXIV_NS)
+            title = (
+                title_elem.text.strip().replace("\n", " ")
+                if title_elem is not None and title_elem.text
+                else ""
+            )
+
+            # Authors
+            authors = []
+            for author in entry.findall("atom:author", ARXIV_NS):
+                name_elem = author.find("atom:name", ARXIV_NS)
+                if name_elem is not None and name_elem.text:
+                    authors.append(name_elem.text)
+
+            # Abstract/Summary
+            summary_elem = entry.find("atom:summary", ARXIV_NS)
+            abstract = (
+                summary_elem.text.strip().replace("\n", " ")
+                if summary_elem is not None and summary_elem.text
+                else ""
+            )
+
+            # Categories
+            categories = []
+            for cat in entry.findall("arxiv:primary_category", ARXIV_NS):
+                term = cat.get("term")
+                if term:
+                    categories.append(term)
+            for cat in entry.findall("atom:category", ARXIV_NS):
+                term = cat.get("term")
+                if term and term not in categories:
+                    categories.append(term)
+
+            # Published date
+            published_elem = entry.find("atom:published", ARXIV_NS)
+            published = (
+                published_elem.text
+                if published_elem is not None and published_elem.text
+                else ""
+            )
+
+            # PDF URL
+            pdf_url = None
+            for link in entry.findall("atom:link", ARXIV_NS):
+                if link.get("title") == "pdf":
+                    pdf_url = link.get("href")
+                    break
+            if not pdf_url:
+                pdf_url = f"http://arxiv.org/pdf/{paper_id}"
+
+            results.append(
+                {
+                    "id": short_id,
+                    "title": title,
+                    "authors": authors,
+                    "abstract": abstract,
+                    "categories": categories,
+                    "published": published,
+                    "url": pdf_url,
+                    "resource_uri": f"arxiv://{short_id}",
+                }
+            )
+
+    except ET.ParseError as e:
+        logger.error(f"Failed to parse arXiv XML response: {e}")
+        raise ValueError(f"Failed to parse arXiv API response: {e}")
+
+    return results
+
 
 search_tool = types.Tool(
     name="search_papers",
@@ -160,29 +348,6 @@ def _optimize_query(query: str) -> str:
     return query
 
 
-def _build_date_filter(date_from: str = None, date_to: str = None) -> str:
-    """Build arXiv API date filter using submittedDate syntax."""
-    if not date_from and not date_to:
-        return ""
-
-    try:
-        # Parse and format dates for arXiv API (YYYYMMDDTTTT format where TTTT is time to minute)
-        if date_from:
-            start_date = parser.parse(date_from).strftime("%Y%m%d0000")
-        else:
-            start_date = "199107010000"  # arXiv started July 1991
-
-        if date_to:
-            end_date = parser.parse(date_to).strftime("%Y%m%d2359")
-        else:
-            end_date = datetime.now().strftime("%Y%m%d2359")
-
-        return f"submittedDate:[{start_date}+TO+{end_date}]"
-    except (ValueError, TypeError) as e:
-        logger.error(f"Error parsing dates: {e}")
-        raise ValueError(f"Invalid date format. Use YYYY-MM-DD format: {e}")
-
-
 def _process_paper(paper: arxiv.Result) -> Dict[str, Any]:
     """Process paper information with resource URI."""
     return {
@@ -198,15 +363,76 @@ def _process_paper(paper: arxiv.Result) -> Dict[str, Any]:
 
 
 async def handle_search(arguments: Dict[str, Any]) -> List[types.TextContent]:
-    """Handle paper search requests with improved arXiv API integration."""
+    """Handle paper search requests with improved arXiv API integration.
+
+    Uses raw HTTP requests when date filtering is requested to avoid URL encoding
+    issues with the arxiv Python package. Falls back to the arxiv package for
+    non-date queries for better compatibility.
+    """
     try:
-        client = arxiv.Client()
         max_results = min(int(arguments.get("max_results", 10)), settings.MAX_RESULTS)
         base_query = arguments["query"]
+        date_from_arg = arguments.get("date_from")
+        date_to_arg = arguments.get("date_to")
+        categories = arguments.get("categories")
+        sort_by_arg = arguments.get("sort_by", "relevance")
 
         logger.debug(
             f"Starting search with query: '{base_query}', max_results: {max_results}"
         )
+
+        # Validate categories if provided
+        if categories and not _validate_categories(categories):
+            return [
+                types.TextContent(
+                    type="text",
+                    text="Error: Invalid category provided. Please check arXiv category names.",
+                )
+            ]
+
+        # Use raw HTTP API when date filtering is requested
+        # This bypasses the arxiv package's URL encoding which breaks date syntax
+        if date_from_arg or date_to_arg:
+            logger.debug(
+                f"Date filtering requested - using raw API: {date_from_arg} to {date_to_arg}"
+            )
+
+            try:
+                optimized_query = (
+                    _optimize_query(base_query) if base_query.strip() else ""
+                )
+                results = await _raw_arxiv_search(
+                    query=optimized_query,
+                    max_results=max_results,
+                    sort_by=sort_by_arg,
+                    date_from=date_from_arg,
+                    date_to=date_to_arg,
+                    categories=categories,
+                )
+
+                logger.info(
+                    f"Raw API search completed: {len(results)} results returned"
+                )
+                response_data = {"total_results": len(results), "papers": results}
+
+                return [
+                    types.TextContent(
+                        type="text", text=json.dumps(response_data, indent=2)
+                    )
+                ]
+
+            except httpx.HTTPStatusError as e:
+                logger.error(f"arXiv API HTTP error: {e}")
+                return [
+                    types.TextContent(
+                        type="text", text=f"Error: arXiv API HTTP error - {str(e)}"
+                    )
+                ]
+            except ValueError as e:
+                return [types.TextContent(type="text", text=f"Error: {str(e)}")]
+
+        # For non-date queries, use the arxiv package (more robust parsing)
+        client = arxiv.Client()
 
         # Build query components
         query_parts = []
@@ -219,26 +445,10 @@ async def handle_search(arguments: Dict[str, Any]) -> List[types.TextContent]:
                 logger.debug(f"Optimized query: '{base_query}' -> '{optimized_query}'")
 
         # Add category filtering
-        if categories := arguments.get("categories"):
-            if not _validate_categories(categories):
-                return [
-                    types.TextContent(
-                        type="text",
-                        text="Error: Invalid category provided. Please check arXiv category names.",
-                    )
-                ]
+        if categories:
             category_filter = " OR ".join(f"cat:{cat}" for cat in categories)
             query_parts.append(f"({category_filter})")
             logger.debug(f"Added category filter: {category_filter}")
-
-        # Add date filtering using arXiv API syntax
-        # Temporarily disable server-side date filtering due to API issues
-        # Will filter client-side for now
-        date_from_arg = arguments.get("date_from")
-        date_to_arg = arguments.get("date_to")
-        if date_from_arg or date_to_arg:
-            logger.debug(f"Date filtering requested: {date_from_arg} to {date_to_arg}")
-            # We'll handle this client-side after getting results
 
         # Combine query parts
         if not query_parts:
@@ -252,12 +462,7 @@ async def handle_search(arguments: Dict[str, Any]) -> List[types.TextContent]:
         final_query = " ".join(query_parts)
         logger.debug(f"Final arXiv query: {final_query}")
 
-        # Increase max_results slightly to account for any edge cases
-        # but cap it to avoid overwhelming the API
-        api_max_results = min(max_results + 5, settings.MAX_RESULTS)
-
         # Determine sort method
-        sort_by_arg = arguments.get("sort_by", "relevance")
         if sort_by_arg == "date":
             sort_criterion = arxiv.SortCriterion.SubmittedDate
             logger.debug("Using date sorting (newest first)")
@@ -267,55 +472,16 @@ async def handle_search(arguments: Dict[str, Any]) -> List[types.TextContent]:
 
         search = arxiv.Search(
             query=final_query,
-            max_results=api_max_results,
+            max_results=max_results,
             sort_by=sort_criterion,
         )
 
-        # Process results with client-side date filtering
+        # Process results
         results = []
-        result_count = 0
-
-        # Parse date filters if provided
-        date_from_parsed = None
-        date_to_parsed = None
-        if date_from_arg:
-            try:
-                date_from_parsed = parser.parse(date_from_arg).replace(
-                    tzinfo=timezone.utc
-                )
-            except (ValueError, TypeError) as e:
-                return [
-                    types.TextContent(
-                        type="text", text=f"Error: Invalid date_from format - {str(e)}"
-                    )
-                ]
-
-        if date_to_arg:
-            try:
-                date_to_parsed = parser.parse(date_to_arg).replace(tzinfo=timezone.utc)
-            except (ValueError, TypeError) as e:
-                return [
-                    types.TextContent(
-                        type="text", text=f"Error: Invalid date_to format - {str(e)}"
-                    )
-                ]
-
         for paper in client.results(search):
-            if result_count >= max_results:
+            if len(results) >= max_results:
                 break
-
-            # Apply client-side date filtering
-            paper_date = paper.published
-            if not paper_date.tzinfo:
-                paper_date = paper_date.replace(tzinfo=timezone.utc)
-
-            if date_from_parsed and paper_date < date_from_parsed:
-                continue
-            if date_to_parsed and paper_date > date_to_parsed:
-                continue
-
             results.append(_process_paper(paper))
-            result_count += 1
 
         logger.info(f"Search completed: {len(results)} results returned")
         response_data = {"total_results": len(results), "papers": results}

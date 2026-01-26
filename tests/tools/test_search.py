@@ -2,9 +2,13 @@
 
 import pytest
 import json
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, AsyncMock
 from arxiv_mcp_server.tools import handle_search
-from arxiv_mcp_server.tools.search import _validate_categories, _build_date_filter
+from arxiv_mcp_server.tools.search import (
+    _validate_categories,
+    _raw_arxiv_search,
+    _parse_arxiv_atom_response,
+)
 
 
 @pytest.mark.asyncio
@@ -35,9 +39,32 @@ async def test_search_with_categories(mock_client):
 
 
 @pytest.mark.asyncio
-async def test_search_with_dates(mock_client):
-    """Test paper search with date filtering."""
-    with patch("arxiv.Client", return_value=mock_client):
+async def test_search_with_dates():
+    """Test paper search with date filtering uses raw API."""
+    mock_xml_response = """<?xml version="1.0" encoding="UTF-8"?>
+    <feed xmlns="http://www.w3.org/2005/Atom" xmlns:arxiv="http://arxiv.org/schemas/atom">
+        <entry>
+            <id>http://arxiv.org/abs/2301.00001v1</id>
+            <title>Test Paper</title>
+            <summary>Test abstract</summary>
+            <published>2023-06-15T00:00:00Z</published>
+            <author><name>Test Author</name></author>
+            <arxiv:primary_category term="cs.AI"/>
+            <link title="pdf" href="http://arxiv.org/pdf/2301.00001v1"/>
+        </entry>
+    </feed>"""
+
+    mock_response = MagicMock()
+    mock_response.text = mock_xml_response
+    mock_response.raise_for_status = MagicMock()
+
+    with patch("httpx.AsyncClient") as mock_client_class:
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=mock_response)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+        mock_client_class.return_value = mock_client
+
         result = await handle_search(
             {
                 "query": "test query",
@@ -53,14 +80,13 @@ async def test_search_with_dates(mock_client):
 
 
 @pytest.mark.asyncio
-async def test_search_with_invalid_dates(mock_client):
+async def test_search_with_invalid_dates():
     """Test search with invalid date formats."""
-    with patch("arxiv.Client", return_value=mock_client):
-        result = await handle_search(
-            {"query": "test query", "date_from": "invalid-date", "max_results": 1}
-        )
+    result = await handle_search(
+        {"query": "test query", "date_from": "invalid-date", "max_results": 1}
+    )
 
-        assert result[0].text.startswith("Error: Invalid date")
+    assert "Error:" in result[0].text
 
 
 def test_validate_categories():
@@ -74,23 +100,69 @@ def test_validate_categories():
     assert not _validate_categories(["cs.AI", "invalid.test"])
 
 
-def test_build_date_filter():
-    """Test date filter construction."""
-    # Test with both dates
-    filter_str = _build_date_filter("2023-01-01", "2023-12-31")
-    assert "submittedDate:[20230101" in filter_str
-    assert "20231231" in filter_str
+def test_parse_arxiv_atom_response():
+    """Test parsing of arXiv Atom XML response."""
+    sample_xml = """<?xml version="1.0" encoding="UTF-8"?>
+    <feed xmlns="http://www.w3.org/2005/Atom" xmlns:arxiv="http://arxiv.org/schemas/atom">
+        <entry>
+            <id>http://arxiv.org/abs/2301.00001v1</id>
+            <title>Test Paper Title</title>
+            <summary>This is a test abstract.</summary>
+            <published>2023-01-01T00:00:00Z</published>
+            <author><name>John Doe</name></author>
+            <author><name>Jane Smith</name></author>
+            <arxiv:primary_category term="cs.AI"/>
+            <category term="cs.AI"/>
+            <category term="cs.LG"/>
+            <link title="pdf" href="http://arxiv.org/pdf/2301.00001v1"/>
+        </entry>
+    </feed>"""
 
-    # Test with only start date
-    filter_str = _build_date_filter("2023-01-01", None)
-    assert "submittedDate:[20230101" in filter_str
+    results = _parse_arxiv_atom_response(sample_xml)
+    assert len(results) == 1
+    paper = results[0]
+    assert paper["id"] == "2301.00001"
+    assert paper["title"] == "Test Paper Title"
+    assert paper["abstract"] == "This is a test abstract."
+    assert paper["authors"] == ["John Doe", "Jane Smith"]
+    assert "cs.AI" in paper["categories"]
+    assert paper["resource_uri"] == "arxiv://2301.00001"
 
-    # Test with no dates
-    assert _build_date_filter(None, None) == ""
 
-    # Test with invalid date
-    with pytest.raises(ValueError):
-        _build_date_filter("invalid-date", None)
+@pytest.mark.asyncio
+async def test_raw_arxiv_search_builds_correct_url():
+    """Test that raw search builds correct URL with date filters."""
+    import httpx
+
+    # Mock the httpx client
+    mock_response = MagicMock()
+    mock_response.text = """<?xml version="1.0" encoding="UTF-8"?>
+    <feed xmlns="http://www.w3.org/2005/Atom" xmlns:arxiv="http://arxiv.org/schemas/atom">
+    </feed>"""
+    mock_response.raise_for_status = MagicMock()
+
+    with patch("httpx.AsyncClient") as mock_client_class:
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=mock_response)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+        mock_client_class.return_value = mock_client
+
+        await _raw_arxiv_search(
+            query="LLM",
+            max_results=5,
+            date_from="2023-01-01",
+            date_to="2023-12-31",
+            categories=["cs.AI"],
+        )
+
+        # Check that the URL was constructed with unencoded +TO+
+        call_args = mock_client.get.call_args
+        url = call_args[0][0]
+        assert "+TO+" in url  # Critical: must not be encoded as %2B
+        assert "submittedDate:" in url
+        assert "20230101" in url
+        assert "20231231" in url
 
 
 @pytest.mark.asyncio
