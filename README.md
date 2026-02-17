@@ -23,9 +23,8 @@ The ArXiv MCP Server provides a bridge between AI assistants and arXiv's researc
 ## ✨ Core Features
 
 - 🔎 **Paper Search**: Query arXiv papers with filters for date ranges and categories
-- 📄 **Paper Access**: Download and read paper content
-- 📋 **Paper Listing**: View all downloaded papers
-- 🗃️ **Local Storage**: Papers are saved locally for faster access
+- 📄 **Paper Download**: Download paper PDFs by arXiv ID
+- 🗃️ **Local Storage**: PDFs are saved locally for faster access
 - 📝 **Prompts**: A Set of Research Prompts
 
 ## 🚀 Quick Start
@@ -101,7 +100,7 @@ For Development:
 
 ## 💡 Available Tools
 
-The server provides four main tools:
+The server provides two main tools:
 
 ### 1. Paper Search
 Search for papers with optional filters:
@@ -124,22 +123,6 @@ result = await call_tool("download_paper", {
 })
 ```
 
-### 3. List Papers
-View all downloaded papers:
-
-```python
-result = await call_tool("list_papers", {})
-```
-
-### 4. Read Paper
-Access the content of a downloaded paper:
-
-```python
-result = await call_tool("read_paper", {
-    "paper_id": "2401.12345"
-})
-```
-
 ## 📝 Research Prompts
 
 The server offers specialized prompts to help analyze academic papers:
@@ -154,7 +137,7 @@ result = await call_prompt("deep-paper-analysis", {
 ```
 
 This prompt includes:
-- Detailed instructions for using available tools (list_papers, download_paper, read_paper, search_papers)
+- Detailed instructions for using available tools (download_paper, search_papers)
 - A systematic workflow for paper analysis
 - Comprehensive analysis structure covering:
   - Executive summary

@@ -2,64 +2,65 @@
 
 import pytest
 import json
-from datetime import datetime
+from pathlib import Path
 from arxiv_mcp_server.tools.download import (
     handle_download,
     get_paper_path,
-    conversion_statuses,
 )
 
 
 @pytest.mark.asyncio
-async def test_download_paper_lifecycle(mocker, temp_storage_path):
-    """Test the complete lifecycle of downloading and converting a paper."""
+async def test_download_paper(mocker, temp_storage_path):
+    """Test downloading a paper as PDF."""
     paper_id = "2103.12345"
+
     # Mock arxiv client and PDF download
-    mocker.patch("arxiv.Client.results")
-    mocker.patch("arxiv.Result.download_pdf")
+    mock_paper = mocker.MagicMock()
+    mock_paper.download_pdf = mocker.MagicMock()
+    mocker.patch("arxiv.Client.results", return_value=iter([mock_paper]))
 
-    # Mock PDF to markdown conversion to happen immediately
-    async def mock_convert(paper_id, pdf_path):
-        md_path = get_paper_path(paper_id, ".md")
-        with open(md_path, "w", encoding="utf-8") as f:
-            f.write("# Test Paper\nConverted content")
-        if paper_id in conversion_statuses:
-            status = conversion_statuses[paper_id]
-            status.status = "success"
-            status.completed_at = datetime.now()
-        pdf_path.unlink()  # Cleanup PDF
-
-    mocker.patch("asyncio.to_thread", side_effect=mock_convert)
-
-    # Initial download request
     response = await handle_download({"paper_id": paper_id})
     status = json.loads(response[0].text)
-    assert status["status"] in ["converting", "success"]
+    assert status["status"] == "success"
+    assert status["paper_id"] == paper_id
+    assert "pdf_path" in status
+    assert status["pdf_path"].endswith(".pdf")
 
-    # Check final status
-    response = await handle_download({"paper_id": paper_id, "check_status": True})
-    final_status = json.loads(response[0].text)
-    assert final_status["status"] in ["success", "converting"]
 
-    # Verify markdown file exists
-    if final_status["status"] == "success":
-        assert get_paper_path(paper_id, ".md").exists()
+@pytest.mark.asyncio
+async def test_download_paper_with_custom_dir(mocker, temp_storage_path):
+    """Test downloading a paper to a custom directory."""
+    paper_id = "2103.12345"
+    custom_dir = str(temp_storage_path / "custom_pdfs")
+
+    # Mock arxiv client and PDF download
+    mock_paper = mocker.MagicMock()
+    mock_paper.download_pdf = mocker.MagicMock()
+    mocker.patch("arxiv.Client.results", return_value=iter([mock_paper]))
+
+    response = await handle_download({
+        "paper_id": paper_id,
+        "download_dir": custom_dir
+    })
+    status = json.loads(response[0].text)
+    assert status["status"] == "success"
+    assert custom_dir in status["pdf_path"]
 
 
 @pytest.mark.asyncio
 async def test_download_existing_paper(temp_storage_path):
     """Test downloading a paper that's already available."""
     paper_id = "2103.12345"
-    md_path = get_paper_path(paper_id, ".md")
+    pdf_path = get_paper_path(paper_id)
 
-    # Create test markdown file
-    md_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(md_path, "w", encoding="utf-8") as f:
-        f.write("# Existing Paper\nTest content")
+    # Create test PDF file
+    pdf_path.parent.mkdir(parents=True, exist_ok=True)
+    pdf_path.write_text("%PDF-1.4 test")
 
     response = await handle_download({"paper_id": paper_id})
     status = json.loads(response[0].text)
     assert status["status"] == "success"
+    assert "already exists" in status["message"]
 
 
 @pytest.mark.asyncio
@@ -74,8 +75,20 @@ async def test_download_nonexistent_paper(mocker):
 
 
 @pytest.mark.asyncio
-async def test_check_unknown_status():
-    """Test checking status of unknown paper."""
-    response = await handle_download({"paper_id": "2103.99999", "check_status": True})
-    status = json.loads(response[0].text)
-    assert status["status"] == "unknown"
+async def test_get_paper_path_default(temp_storage_path, mocker):
+    """Test get_paper_path uses default storage path."""
+    paper_id = "2103.12345"
+    path = get_paper_path(paper_id)
+    assert path.suffix == ".pdf"
+    assert path.stem == paper_id
+
+
+@pytest.mark.asyncio
+async def test_get_paper_path_custom_dir(temp_storage_path, mocker):
+    """Test get_paper_path with custom directory."""
+    paper_id = "2103.12345"
+    custom_dir = "/custom/download/path"
+    path = get_paper_path(paper_id, custom_dir)
+    assert path.suffix == ".pdf"
+    assert path.stem == paper_id
+    assert str(path).startswith(custom_dir)
