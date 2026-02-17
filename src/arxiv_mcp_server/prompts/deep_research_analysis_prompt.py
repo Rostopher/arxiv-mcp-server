@@ -8,6 +8,10 @@ AVAILABLE TOOLS:
 1. download_paper: Download a paper PDF by arXiv ID
 2. search_papers: Find related papers on the same topic to provide context
 
+USAGE NOTES:
+- search_papers supports arXiv ID queries (e.g., "2401.12345"), fielded queries like ti:"title", au:"author", abs:"keyword", and boolean operators AND/OR/ANDNOT.
+- download_paper accepts optional download_dir to choose where the PDF is saved.
+
 <workflow-for-paper-analysis>
 <preparation>
   - Use the download_paper tool to retrieve the paper PDF by ID

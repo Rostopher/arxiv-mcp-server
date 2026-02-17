@@ -114,12 +114,37 @@ result = await call_tool("search_papers", {
 })
 ```
 
+Examples of supported query patterns:
+
+```python
+# Search by arXiv ID
+await call_tool("search_papers", {"query": "2401.12345"})
+
+# Title-only search
+await call_tool("search_papers", {"query": 'ti:"transformer architecture"'})
+
+# Author + title
+await call_tool("search_papers", {"query": 'au:"Hinton" AND ti:"deep learning"'})
+
+# Abstract keyword with exclusion
+await call_tool("search_papers", {"query": 'abs:"transformer" ANDNOT "survey"'})
+```
+
 ### 2. Paper Download
-Download a paper by its arXiv ID:
+Download a paper by its arXiv ID. You can optionally pass `download_dir` to choose where the PDF is saved:
 
 ```python
 result = await call_tool("download_paper", {
     "paper_id": "2401.12345"
+})
+```
+
+Download to a custom directory:
+
+```python
+result = await call_tool("download_paper", {
+    "paper_id": "2401.12345",
+    "download_dir": "/path/to/save/pdfs"
 })
 ```
 
